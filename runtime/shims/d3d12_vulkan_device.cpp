@@ -4108,6 +4108,26 @@ struct DeviceState {
 
     enum class VsharpPath { table, shadow, scratch };
     enum class VsharpResult { unchanged, rebased, empty };
+    // What fix_vsharp resolved a V# to, for a console heap's slot record (ConsoleHeapSlotRecords::set).
+    struct VsharpRecord {
+        leonida::ConsoleHeapSlotRecords::State state = leonida::ConsoleHeapSlotRecords::none;
+        uint64_t base = 0, span = 0, target = 0;
+    };
+    // A buffer V#'s words, and what fix_vsharp made of them (ConsoleHeap::answers).
+    struct VsharpWords {
+        std::uint64_t low = 0, high = 0;
+        bool operator==(const VsharpWords&) const = default;
+    };
+    struct VsharpWordsHash {
+        std::size_t operator()(const VsharpWords& words) const noexcept {
+            return std::hash<std::uint64_t>{}(words.low ^ (words.high * 0x9e3779b97f4a7c15ull));
+        }
+    };
+    struct VsharpAnswer {
+        std::uint32_t words[3];
+        VsharpResult result;
+        VsharpRecord record;
+    };
 
     // `refused` (when given): for an answer of 0, the copy an alias range named that was not backed (0: none), so the
     // console heap's slot record is found again when a backing is added there.
@@ -4210,11 +4230,6 @@ struct DeviceState {
         }
     }
 
-    // What fix_vsharp resolved a V# to, for a console heap's slot record (ConsoleHeapSlotRecords::set).
-    struct VsharpRecord {
-        leonida::ConsoleHeapSlotRecords::State state = leonida::ConsoleHeapSlotRecords::none;
-        uint64_t base = 0, span = 0, target = 0;
-    };
     VsharpResult fix_vsharp(uint32_t* w, VsharpPath path, VsharpRecord* record = nullptr) {
         if ((w[3] >> 30) || !w[2]) return VsharpResult::unchanged; // image, empty slot or raw pointer
         const uint64_t base = uint64_t(w[0]) | (uint64_t(w[1] & 0xffff) << 32);
@@ -4532,6 +4547,9 @@ struct DeviceState {
         leonida::ConsoleHeapSlotRecords records;
         std::vector<std::uint32_t> retries;
         std::size_t retry_at = 0;  // where retry_console_slots goes on
+        // fix_vsharp's answers during one pass over the heap's slots (fix_heap_vsharp), cleared after it.
+        std::unordered_map<VsharpWords, VsharpAnswer, VsharpWordsHash> answers;
+        bool answering = false;
         // fix_console_slots' budget, for the current refresh, and the slots it nulled since the last log line
         std::chrono::steady_clock::time_point fix_start{};
         bool fix_over = false;
@@ -4540,7 +4558,7 @@ struct DeviceState {
         std::uint64_t refreshes = 0, logged = 0;
         std::chrono::steady_clock::time_point log_time{};
         // Since the last log line.
-        std::uint64_t copied = 0, vsharps = 0, unbacked = 0, retried = 0;
+        std::uint64_t copied = 0, vsharps = 0, unbacked = 0, retried = 0, reused = 0;
         std::uint64_t images[5] = {};  // by TitleImage
         std::map<std::string, std::uint64_t> refused_reasons;
         double ms = 0, pages_ms = 0, fix_ms = 0, retry_ms = 0;  // ms: all; the others its parts
@@ -4626,6 +4644,23 @@ struct DeviceState {
         return true;
     }
 
+    // fix_vsharp, asked once for each distinct V# in a pass over a heap's slots (heap.answering). The title writes the
+    // same words into thousands of slots, many of them data that reads as a V# into title memory with no copy, and
+    // each such answer costs VirtualQuery calls: under Wine a third of the submitting thread's time in the world.
+    VsharpResult fix_heap_vsharp(ConsoleHeap& heap, std::uint32_t* w, VsharpPath path, VsharpRecord* record) {
+        if (!heap.answering || (w[3] >> 30) || !w[2]) return fix_vsharp(w, path, record);
+        const VsharpWords key{w[0] | std::uint64_t(w[1]) << 32, w[2] | std::uint64_t(w[3]) << 32};
+        if (const auto it = heap.answers.find(key); it != heap.answers.end()) {
+            std::memcpy(w, it->second.words, sizeof(it->second.words));
+            *record = it->second.record;
+            ++heap.reused;
+            return it->second.result;
+        }
+        const VsharpResult result = fix_vsharp(w, path, record);
+        heap.answers.emplace(key, VsharpAnswer{{w[0], w[1], w[2]}, result, *record});
+        return result;
+    }
+
     // Slot `slot` of a heap copy, as the title wrote it, fixed up as described above, and the only writer of a
     // resource heap's slot records. True when it is settled: not a T# whose texture is still to come. A sampler heap
     // holds S#s: copied as written.
@@ -4643,14 +4678,14 @@ struct DeviceState {
             // and recorded as waiting: a backing, alias range or title memory added over it fixes the slot again
             // (apply_slot_changes).
             vsharp = true;
-            const VsharpResult result = fix_vsharp(w, path, &halves[0]);
+            const VsharpResult result = fix_heap_vsharp(heap, w, path, &halves[0]);
             if (result == VsharpResult::rebased) ++heap.vsharps;
             // Only the GPU copy changes; the title's bytes (heap.previous) stay as written.
             if (result == VsharpResult::empty) ++heap.unbacked;
             // The slot's second V# is a UAV counter (raw, 4 bytes, in the descriptor's upper 16 bytes): a store to it at
             // heap_base + a raw title address loses the device just as one through the buffer V# does. A counter with
             // no backing is nulled and waits as the buffer V# does.
-            if (fix_vsharp(w + 4, path, &halves[1]) == VsharpResult::empty) ++heap.unbacked;
+            if (fix_heap_vsharp(heap, w + 4, path, &halves[1]) == VsharpResult::empty) ++heap.unbacked;
         } else {
             leonida::gfx10::ImageWords words;
             std::memcpy(words.data(), w, sizeof(words));
@@ -4849,10 +4884,14 @@ struct DeviceState {
         heap.fix_start = t1;
         heap.fix_over = false;
         heap.fix_count = 0;
+        heap.answering = true;
         heap.pages->for_each_copied([&](std::size_t offset, std::size_t bytes) { fix_console_slots(heap, offset, bytes); });
+        heap.answers.clear();  // the changes below can release what an answer of the pass above named
         // Even an unchanged title slot may name a buffer released since the last submission: the slots the changes
         // touch are fixed again, found by their records.
         if (changes) apply_slot_changes(heap, *changes);
+        heap.answering = false;
+        heap.answers.clear();
         const auto t2 = clock::now();
         // T#s whose texture is not there yet, and slots the fix budget deferred.
         if (!heap.retries.empty()) retry_console_slots(heap);
@@ -4899,8 +4938,9 @@ struct DeviceState {
                          "in %.3f ms on average (pages %.3f, fixing copied slots %.3f, %llu left to retries past the "
                          "budget, retrying %.3f: %.1f slots a "
                          "submission, %zu waiting), %llu write faults; %llu title V#s rebased, %llu with no copy given "
-                         "no records (%zu V# halves waiting for a backing), T#s %llu known, %llu bound, %llu "
-                         "naming no texture, %llu refused, %llu words that are no V# or T# (data, null in the copy)\n",
+                         "no records (%zu V# halves waiting for a backing), %llu answered by an earlier slot of the pass, "
+                         "T#s %llu known, %llu bound, %llu naming no texture, %llu refused, %llu words that are no "
+                         "V# or T# (data, null in the copy)\n",
                          static_cast<unsigned long long>(heap->console_va), heap->imported ? "imported" : "copy",
                          static_cast<unsigned long long>(heap->refreshes), "copied",
                          double(heap->copied) / 1024.0 / count,
@@ -4910,6 +4950,7 @@ struct DeviceState {
                          static_cast<unsigned long long>(heap->pages ? heap->pages->faults() : 0),
                          static_cast<unsigned long long>(heap->vsharps),
                          static_cast<unsigned long long>(heap->unbacked), heap->records.waiting_count(),
+                         static_cast<unsigned long long>(heap->reused),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::known)]),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::bound)]),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::unknown)]),
@@ -4953,7 +4994,7 @@ struct DeviceState {
                 std::fprintf(stderr, "[rt] d3d12: console descriptor heap 0x%llx unbound T#s by reason: %s\n",
                              static_cast<unsigned long long>(heap->console_va), refused_breakdown.c_str());
             heap->refused_reasons.clear();
-            heap->copied = heap->vsharps = heap->unbacked = heap->retried = heap->deferred_fixes = 0;
+            heap->copied = heap->vsharps = heap->unbacked = heap->retried = heap->reused = heap->deferred_fixes = 0;
             for (auto& n : heap->images) n = 0;
             heap->ms = heap->pages_ms = heap->fix_ms = heap->retry_ms = 0;
             if (start - arena_log_time >= std::chrono::seconds(60)) {

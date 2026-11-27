@@ -305,8 +305,11 @@ void check_read_file_first_touch(const std::filesystem::path& root) {
         CloseHandle(h);
         return std::make_pair(ok ? got : 0, error);
     };
+    // Wine maps a reserve-only view fully accessible, so its ReadFile simply succeeds.
+    const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
     const auto host = read_into_view(&::ReadFile);
-    check(host.second == ERROR_NOACCESS, "the host ReadFile into uncommitted pages fails with ERROR_NOACCESS");
+    check(host.second == (wine ? 0 : ERROR_NOACCESS),
+          "the host ReadFile into uncommitted pages fails with ERROR_NOACCESS (Wine: succeeds)");
     const auto shimmed = read_into_view(shim_read);
     check(shimmed.second == 0 && shimmed.first == kSize, "the shimmed ReadFile commits the pages and reads it all");
     check(std::memcmp(g_first_touch + 0x800, data.data(), kSize) == 0, "the bytes read are the file's");
@@ -1940,6 +1943,12 @@ void run_checks(const std::filesystem::path& root) {
         for (size_t i = 0; i < short_matches.size(); ++i) {
             char detail[96];
             std::snprintf(detail, sizeof detail, "the long listing matches short Win32 for %ls", masks[i]);
+            // Wine's short search for *.?. lists mesh.txt, whose three-letter extension one ? cannot match: no
+            // reference there.
+            if (std::wcscmp(masks[i], L"*.?.") == 0 && contains(short_matches[i], L"mesh.txt")) {
+                std::printf("SKIP %s: the host's short search lists mesh.txt\n", detail);
+                continue;
+            }
             check(long_matches[i] == short_matches[i], detail);
         }
 

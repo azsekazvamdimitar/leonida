@@ -41,9 +41,13 @@ HWND create_test_window(int w, int h) {
     RegisterClassW(&wc);
     RECT rc{0, 0, w, h};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    return CreateWindowExW(0, wc.lpszClassName, L"Leonida DXGI host answers", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                           CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, wc.hInstance,
-                           nullptr);
+    HWND window = CreateWindowExW(0, wc.lpszClassName, L"Leonida DXGI host answers", WS_OVERLAPPEDWINDOW,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr,
+                                  nullptr, wc.hInstance, nullptr);
+    // Shown: a Wayland compositor never answers a FIFO present on a surface that was never mapped (Wine's
+    // winewayland), so a hidden window blocks the first vsync present forever.
+    if (window) ShowWindow(window, SW_SHOWNOACTIVATE);
+    return window;
 }
 
 struct Side {

@@ -2034,9 +2034,14 @@ if(TARGET Vulkan::Headers)
   # device fails the run in vk_descriptor_bench and vk_sandbox too, instead of testing another GPU (TEST-1141).
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_FOUND)
+    # Python runs on the host, so a cross build passes its emulator for the script to put in front of the tools.
+    set(_filter_runner)
+    foreach(_part IN LISTS CMAKE_CROSSCOMPILING_EMULATOR)
+      list(APPEND _filter_runner "--runner=${_part}")
+    endforeach()
     add_test(NAME vk_device_filter_tools COMMAND "${Python3_EXECUTABLE}" -I
              "${CMAKE_CURRENT_SOURCE_DIR}/test/check_device_filter_tools.py" "$<TARGET_FILE:vk_descriptor_bench>"
-             "$<TARGET_FILE:vk_sandbox>" "${CMAKE_CURRENT_BINARY_DIR}/vk_device_filter_tools")
+             "$<TARGET_FILE:vk_sandbox>" "${CMAKE_CURRENT_BINARY_DIR}/vk_device_filter_tools" ${_filter_runner})
     set_tests_properties(vk_device_filter_tools PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   if(MSVC)

@@ -1451,12 +1451,19 @@ int main() {
                 EXPECT(real_frame(i, shown));
                 if (!shown) ++skipped_presents;
             }
-            EXPECT(skipped_presents > 0);
+            // Wine's winewayland cannot keep a window minimised: Wayland has no minimised state, so the compositor's
+            // next configure restores it, and nothing was left to skip.
+            const bool restored_at_once = skipped_presents == 0 && !IsIconic(window);
+            EXPECT(skipped_presents > 0 || restored_at_once);
             ShowWindow(window, SW_RESTORE);
             bool shown = false;
             for (int i = 0; i < 3 && !shown; ++i) EXPECT(real_frame((i + 1) % 3, shown));  // stale, then recreated
             EXPECT(shown);
-            std::printf("minimised: %d of 3 presents skipped and not read back; restored: shown again\n", skipped_presents);
+            if (restored_at_once)
+                std::printf("minimised: not checked, the window was restored at once (Wine's winewayland)\n");
+            else
+                std::printf("minimised: %d of 3 presents skipped and not read back; restored: shown again\n",
+                            skipped_presents);
         }
         EXPECT(real.PresentX(0, nullptr, nullptr) == S_OK);  // the shutdown blank
     }

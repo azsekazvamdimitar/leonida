@@ -3,6 +3,7 @@
 // both sides. Covers UNORM/SNORM/FLOAT/UINT/SINT render targets and depth/stencil, full and rectangle clears, and RTVs
 // through castable-format lists in the other channel order.
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
+#include "host_wine.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
@@ -470,6 +471,9 @@ int main(int argc, char** argv) {
             }
             return check_shared_exponent_target(ours.p) ? 0 : 1;
         }
+        // Wine's WARP is vkd3d, which saturates out-of-range integer clears differently: only the layer's own
+        // check runs there.
+        if (hostwine::host_is_wine()) return check_unlisted_rtvs(ours.p) ? 77 : 1;
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> warp;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||

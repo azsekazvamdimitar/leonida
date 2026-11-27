@@ -4,11 +4,14 @@ With a filter that matches no device, a tool must not choose another GPU. It nam
 the other harnesses do (runtime/test/vk_device_pick.h, docs/testing.md "Choosing the GPU"). Before, both tools
 ignored the filter and ran on the best-ranked GPU.
 
-    python -I check_device_filter_tools.py <vk_descriptor_bench> <vk_sandbox> <work dir>
+    python -I check_device_filter_tools.py <vk_descriptor_bench> <vk_sandbox> <work dir> [--runner=<word> ...]
+
+A cross build names its emulator (Wine) one word per --runner, as runtime/test/check_d3d12_trace.py does.
 
 Exit 0 when both tools refuse the filter, 1 when one does not or when the device list fails for another reason, and
 77 (skip) on a machine with no Vulkan loader, driver or device, where no tool can choose one. Standard library only.
 """
+import argparse
 import os
 import re
 import struct
@@ -38,21 +41,24 @@ def no_vulkan(code, out):
 
 
 def main(argv):
-    if len(argv) != 4:
-        print(__doc__, file=sys.stderr)
-        return 2
-    bench, sandbox, work = argv[1:]
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("bench")
+    parser.add_argument("sandbox")
+    parser.add_argument("work")
+    parser.add_argument("--runner", action="append", default=[])
+    options = parser.parse_args(argv[1:])
+    bench, sandbox, work = [*options.runner, options.bench], [*options.runner, options.sandbox], options.work
     os.makedirs(work, exist_ok=True)
 
     # The device list ignores the filter, so it shows whether there is any device to choose from.
     plain = {k: v for k, v in os.environ.items() if k != "LEONIDA_VK_DEVICE"}
-    code, out = run([bench, "--list-devices"], env=plain)
+    code, out = run([*bench, "--list-devices"], env=plain)
     reason = no_vulkan(code, out)
     if reason:
         print(f"SKIP: no Vulkan device to choose from ({reason})")
         return UNSUPPORTED
     if code != 0:   # anything else is a failure of the tool, not a machine without Vulkan
-        print(f"FAIL: {bench} --list-devices exit {code}:\n{out.strip()}")
+        print(f"FAIL: {bench[-1]} --list-devices exit {code}:\n{out.strip()}")
         return 1
 
     # The smallest scene vk_sandbox reads: magic, version 1, no textures, meshes or draws, and a centre.
@@ -63,8 +69,8 @@ def main(argv):
 
     env = dict(plain, LEONIDA_VK_DEVICE=FILTER)
     failures = []
-    for name, cmd in (("vk_descriptor_bench", [bench]),
-                      ("vk_sandbox", [sandbox, scene, missing, missing, "--out", os.path.join(work, "out.ppm")])):
+    for name, cmd in (("vk_descriptor_bench", bench),
+                      ("vk_sandbox", [*sandbox, scene, missing, missing, "--out", os.path.join(work, "out.ppm")])):
         code, out = run(cmd, env=env)
         named = f"LEONIDA_VK_DEVICE={FILTER}" in out
         if code == 0 or not named or "device:" in out:

@@ -57,9 +57,13 @@ HWND create_test_window() {
         RegisterClassW(&wc);
         registered = true;
     }
-    return CreateWindowExW(0, L"LeonidaDxgiWaitableLatencyTestWnd", L"Leonida Waitable Latency Test",
-                           WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 128, 128, nullptr, nullptr,
-                           GetModuleHandleW(nullptr), nullptr);
+    HWND window = CreateWindowExW(0, L"LeonidaDxgiWaitableLatencyTestWnd", L"Leonida Waitable Latency Test",
+                                  WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 128, 128, nullptr, nullptr,
+                                  GetModuleHandleW(nullptr), nullptr);
+    // Shown: a Wayland compositor never answers a FIFO present on a surface that was never mapped (Wine's
+    // winewayland), so a hidden window blocks the first vsync present forever.
+    if (window) ShowWindow(window, SW_SHOWNOACTIVATE);
+    return window;
 }
 
 int drain_semaphore(HANDLE h, int limit = 128) {

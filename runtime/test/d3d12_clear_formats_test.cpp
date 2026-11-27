@@ -5,6 +5,7 @@
 // No game data or shaders. Run explicitly (needs Vulkan hardware and WARP); LEONIDA_VK_VALIDATION=1 checks Vulkan
 // usage. A format the layer cannot create yet is listed as "not exposed" and does not fail the test; any other
 // difference does.
+#include "host_wine.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
@@ -326,6 +327,7 @@ int main() {
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
+    if (hostwine::host_is_wine()) return 77;  // every case is compared with WARP, which Wine's vkd3d is not
     const unsigned errors_before = vk.validation_errors();
     Tally tally;
     {
