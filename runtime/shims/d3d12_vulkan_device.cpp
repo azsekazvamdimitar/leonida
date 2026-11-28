@@ -292,6 +292,15 @@ bool async_texture_refresh() {
     }();
     return enabled;
 }
+// LOCAL: LEONIDA_LOCAL_TITLE_RANGE_INDEX=1 makes the synchronous pass find the textures over written ranges and map
+// changes through texture_ranges, as the asynchronous one does, instead of walking the whole registry.
+bool title_range_index() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("LEONIDA_LOCAL_TITLE_RANGE_INDEX");
+        return async_texture_refresh() || (v && std::strcmp(v, "1") == 0);
+    }();
+    return enabled;
+}
 // Set while this thread is inside the title-texture registry (it holds title_texture_mutex): a staged copy it makes
 // submits through a queue, whose before-submission refresh must then not take the registry again.
 thread_local bool t_in_title_textures = false;
@@ -13694,7 +13703,7 @@ bool title_xg_layout(const Resource& r, rt::xg_xs::Texture& out, std::array<std:
 }
 
 void DeviceState::index_texture(const TitleTexture& t) {
-    if (async_texture_refresh())
+    if (title_range_index())
         texture_ranges.set(t.address, t.cpu, t.layout_known && !t.gpu_written ? t.layout.layout.size : 0);
 }
 
@@ -13777,7 +13786,10 @@ void DeviceState::drain_titles_gone() {
     std::lock_guard lock(title_texture_mutex);
     for (const auto& [resource, address] : titles_gone) {
         const auto it = title_textures.find(address);
-        if (it != title_textures.end() && !it->second->resource) title_textures.erase(it);
+        if (it != title_textures.end() && !it->second->resource) {
+            texture_ranges.erase(address);
+            title_textures.erase(it);
+        }
     }
     titles_gone.clear();
     titles_gone_pending.store(false, std::memory_order_release);
@@ -15728,6 +15740,7 @@ public:
                                    : leonida::title_texture_snapshot(state_.title_textures);
         if (async) title_slice_ = entries.size() == 128 ? entries.back().first + 1 : 0;
         title_pass_ = true;
+        stats.snapshot_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - now).count();
         std::uint64_t checked = 0, filled = 0, fill_pass_ns = 0;
         const auto visit = [&](TitleTexture& t) {
             // A slot-133 texture's guessed layout (no slot-70 view yet) is only used once the title maps it.
@@ -15827,6 +15840,7 @@ public:
         leonida::merge_title_writes(title_map_changes_);
         stats.map_ranges += title_map_changes_.size();
         stats.map_all += map_all;
+        const auto invalidate_start = clock::now();
         if (!written.empty() || overflow || map_all || !title_map_changes_.empty()) {
             stats.written_ranges += written.size();
             leonida::merge_title_writes(written);
@@ -15836,7 +15850,7 @@ public:
                 if (write) t.stale = true;
                 if (overflow) t.hashed = false;
             };
-            if (!async || overflow || map_all) {
+            if (!title_range_index() || overflow || map_all) {
                 // No fills or callbacks during invalidation; registry iterators stay valid.
                 for (const auto& [key, ptr] : state_.title_textures) {
                     auto& t = *ptr;
@@ -15851,7 +15865,7 @@ public:
                         state_.texture_ranges.overlapping(from, to, [&](auto key) {
                             auto& t = *state_.title_textures.at(key);
                             invalidate(t, write);
-                            if (t.stale) queue_title_fill(key);
+                            if (async && t.stale) queue_title_fill(key);
                         });
                 };
                 apply(title_map_changes_, false);
@@ -15859,6 +15873,7 @@ public:
             }
         }
         const auto every_start = clock::now();
+        stats.invalidate_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(every_start - invalidate_start).count();
         stats.written_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(every_start - now).count();
         // LEONIDA_TITLE_EVERY_BUDGET_US (0, the default: no limit, as before) limits the synchronous pass, the one that
         // runs before a submission on the title's submitting thread: the mapped and stale textures are visited for at
@@ -15947,7 +15962,12 @@ public:
                              static_cast<unsigned long long>(stats.mapped_fills));
                 stats.mapped_checks = stats.mapped_changed = stats.mapped_fills = 0;
             }
-            if (leonida::fsdraw::enabled()) log_title_census("refresh");
+            // LOCAL: LEONIDA_LOCAL_TEXTURE_CENSUS=1 prints the census (pass split) without the fsdraw probe.
+            static const bool local_census = [] {
+                const char* v = std::getenv("LEONIDA_LOCAL_TEXTURE_CENSUS");
+                return v && v[0] == '1';
+            }();
+            if (leonida::fsdraw::enabled() || local_census) log_title_census("refresh");
         }
         inside.reset();
         lock.unlock();
@@ -15971,6 +15991,7 @@ private:
         // Split of refresh_ns: taking and matching the XG-written ranges, the mapped and stale textures visited every
         // pass (and how many), and the fills inside both.
         std::uint64_t written_ns = 0, every_pass_ns = 0, every_pass_visits = 0, fill_ns = 0;
+        std::uint64_t snapshot_ns = 0, invalidate_ns = 0;  // LOCAL: parts of written_ns
         std::uint64_t map_ranges = 0, map_all = 0;  // title memory map changes taken, passes that retried all
         // Readability probes (texture_memory_readable) since the last log line: [0] in refresh passes, [1] elsewhere
         // (slot-70 views, new images). A recheck is a probe of a texture whose memory was not readable at its last
@@ -16725,6 +16746,12 @@ private:
                              "slot-70 views awaiting readable memory: %llu\n",
                      static_cast<unsigned long long>(host.copies), static_cast<unsigned long long>(host.waits),
                      static_cast<unsigned long long>(s.pending_views));
+        const auto staged = state_.context->staged_wait_stats();
+        std::fprintf(stderr, "[rt] d3d12: LOCAL staged title writes waited %llu times, %.1f ms in all, %llu timed out, "
+                             "%llu left work on the write's own queue to its barrier\n",
+                     static_cast<unsigned long long>(staged.waits), double(staged.ns) / 1e6,
+                     static_cast<unsigned long long>(staged.timeouts),
+                     static_cast<unsigned long long>(staged.left_to_barrier));
         std::fprintf(stderr, "[rt] d3d12: title textures census (format/Layout/dimension/mips:views): %s\n",
                      census.c_str());
         if (!refused.empty()) std::fprintf(stderr, "[rt] d3d12: title textures null views by reason: %s\n", refused.c_str());
@@ -16782,10 +16809,13 @@ private:
             std::fprintf(stderr,
                          "[rt] title texture pass split: written ranges and map changes %.3f ms/pass (%.1f map ranges a "
                          "pass, %llu passes probed all), mapped and stale textures %.3f ms/pass (%.1f visited a pass), "
-                         "fills %.3f ms/pass\n",
+                         "fills %.3f ms/pass; LOCAL: snapshot %.3f ms/pass, invalidation %.3f ms/pass, %zu textures\n",
                          double(s.written_ns) * ms_per_ns_per_pass, double(s.map_ranges) * per_pass,
                          static_cast<unsigned long long>(s.map_all), double(s.every_pass_ns) * ms_per_ns_per_pass,
-                         double(s.every_pass_visits) * per_pass, double(s.fill_ns) * ms_per_ns_per_pass);
+                         double(s.every_pass_visits) * per_pass, double(s.fill_ns) * ms_per_ns_per_pass,
+                         double(s.snapshot_ns) * ms_per_ns_per_pass, double(s.invalidate_ns) * ms_per_ns_per_pass,
+                         state_.title_textures.size());
+            s.snapshot_ns = s.invalidate_ns = 0;
             s.written_ns = s.every_pass_ns = s.every_pass_visits = s.fill_ns = s.map_ranges = s.map_all = 0;
             s.hash_ns = s.refresh_ns = s.max_refresh_ns = 0;
             s.written_ranges = 0;
