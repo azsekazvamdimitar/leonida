@@ -1660,16 +1660,25 @@ public:
     // image). The staged write is ordered behind them anyway (same queue, an ALL_COMMANDS barrier); the host copy
     // is not, so a presented title texture can be written while a present still reads it (a torn frame, no fault).
     // With submit_mutex_ held.
-    VkResult wait_submitted_locked(std::uint64_t timeout_ns, const char* what) {
+    // LOCAL (LEONIDA_LOCAL_STAGED_SAME_QUEUE): `ordered`, when set, is the VkQueue the caller submits its write to
+    // behind an ALL_COMMANDS barrier; work already submitted to that queue is ordered before the write on the GPU, so
+    // only the other queues' work is waited for here. *skipped says whether any pending work was left to the barrier.
+    VkResult wait_submitted_locked(std::uint64_t timeout_ns, const char* what, VkQueue ordered = VK_NULL_HANDLE,
+                                   bool* skipped = nullptr) {
         if (is_device_lost()) return VK_ERROR_DEVICE_LOST;  // a queue's timeline may be gone already
         const auto pending = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
         if (pending.empty()) return VK_SUCCESS;
         std::vector<VkSemaphore> semaphores;
         std::vector<std::uint64_t> values;
         for (const auto& [semaphore, value] : pending) {
+            if (ordered && progress_queue_locked(semaphore) == ordered) {
+                if (skipped) *skipped = true;
+                continue;
+            }
             semaphores.push_back(semaphore);
             values.push_back(value);
         }
+        if (semaphores.empty()) return VK_SUCCESS;
         VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
         wait.semaphoreCount = std::uint32_t(semaphores.size());
         wait.pSemaphores = semaphores.data();
@@ -1716,16 +1725,31 @@ public:
     // A complete CPU-side replacement of these color subresources. Serialize with replay and
     // present while recording the old layouts, finishing prior reads and publishing the copy.
     template<class Copy>
-    VkResult write_staged_title_image(ResourceId id, const VkImageSubresourceRange& range, Copy&& copy) {
+    VkResult write_staged_title_image(ResourceId id, const VkImageSubresourceRange& range, Copy&& copy,
+                                      VkQueue ordered = VK_NULL_HANDLE) {
         std::lock_guard layout_lock(tracker_mutex_);
         std::lock_guard queue_lock(submit_mutex_);
         LayoutPieces pieces;
         if (!tracker_.pieces(id, range, pieces) || pieces.empty()) return VK_ERROR_UNKNOWN;
         if (image_work_pending_) {
             const SubmitMutex::SubmitTurn turn(submit_mutex_);  // a queue operation: the compile gate (as above)
-            const auto r = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title staging)");
+            static const bool same_queue = [] {
+                const char* v = std::getenv("LEONIDA_LOCAL_STAGED_SAME_QUEUE");
+                return v && v[0] == '1';
+            }();
+            bool skipped = false;
+            const auto started = std::chrono::steady_clock::now();
+            const auto r = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title staging)",
+                                                 same_queue ? ordered : VK_NULL_HANDLE, &skipped);
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                                 started).count();
+            staged_wait_stats_.waits++;
+            staged_wait_stats_.ns += std::uint64_t(ns);
+            if (skipped) staged_wait_stats_.left_to_barrier++;
+            if (r == VK_TIMEOUT) staged_wait_stats_.timeouts++;
             if (r != VK_SUCCESS) return r;
-            image_work_pending_ = false;
+            // The host copy (write_host_texture) needs every queue done: keep the flag when work was left to the barrier.
+            if (!skipped) image_work_pending_ = false;
         }
         const auto r = observe_result(copy(replay_, pieces), "title staging upload");
         if (r == VK_SUCCESS) {
@@ -2051,10 +2075,21 @@ public:
 
     // Both methods are called with submit_mutex_ held. A queue's own progress timeline is
     // monotonic even when another queue completes first; global tickets are retired in order.
-    void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
+    void record_submit_locked(VkSemaphore progress, std::uint64_t value, VkQueue queue = VK_NULL_HANDLE) {
         const auto ticket = submitted_ticket_.fetch_add(1, std::memory_order_acq_rel) + 1;
         retire_tickets_.record(ticket, progress, value);
+        if (queue && !progress_queue_locked(progress)) progress_queues_.emplace_back(progress, queue);
         note_image_work_locked();
+    }
+    VkQueue progress_queue_locked(VkSemaphore progress) const {
+        for (const auto& [semaphore, queue] : progress_queues_)
+            if (semaphore == progress) return queue;
+        return VK_NULL_HANDLE;
+    }
+    struct StagedWaitStats { std::uint64_t waits = 0, ns = 0, left_to_barrier = 0, timeouts = 0; };
+    StagedWaitStats staged_wait_stats() {
+        std::lock_guard lock(submit_mutex_);
+        return staged_wait_stats_;
     }
     void retire_queue_idle_locked(VkSemaphore progress) {
         retire_tickets_.queue_idle(progress);
@@ -2368,6 +2403,8 @@ private:
     alignas(64) SubmitMutex submit_mutex_;
     bool image_work_pending_ = false;  // under submit_mutex_
     HostTextureStats host_texture_stats_;  // under submit_mutex_
+    StagedWaitStats staged_wait_stats_;  // under submit_mutex_
+    std::vector<std::pair<VkSemaphore, VkQueue>> progress_queues_;  // under submit_mutex_
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
@@ -4234,7 +4271,7 @@ private:
                 pending_bindings_.pop_back();
                 return false;
             }
-            context_.record_submit_locked(progress_, ticket);
+            context_.record_submit_locked(progress_, ticket, queue_);
         }
         submitted_ = last_sparse_ = ticket;
         clear_waits(ticket);
@@ -4479,7 +4516,7 @@ private:
             context_.gpu_labels_.submitted(command_buffer, res == VK_SUCCESS);
             if (ring) ring->end_submit(ring_at, diagnostic_ms() - submit_start, res);
             if (res == VK_SUCCESS) {
-                context_.record_submit_locked(progress_, ticket);
+                context_.record_submit_locked(progress_, ticket, queue_);
                 if (signals_fence) context_.holds().signaled(fence, value);
             }
         }

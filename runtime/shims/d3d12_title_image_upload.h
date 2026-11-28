@@ -105,7 +105,7 @@ public:
                     VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             if ((r = vk.vkEndCommandBuffer(slot.command)) != VK_SUCCESS) return r;
             return submit(d, slot);
-        });
+        }, d.info.queue);
         return result == VK_SUCCESS;
     }
 
