@@ -1277,7 +1277,9 @@ int main(int argc, char** argv) {
     LOADD(vkCreatePipelineLayout); LOADD(vkCreateComputePipelines); LOADD(vkCreateGraphicsPipelines);
     LOADD(vkDestroyPipeline); LOADD(vkCreatePipelineCache); LOADD(vkGetPipelineCacheData);
     LOADD(vkGetPipelineExecutablePropertiesKHR); LOADD(vkGetPipelineExecutableStatisticsKHR);
-    const VkPipelineCreateFlags capture = stats_path.empty() ? 0 : VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    const char* local_fast = std::getenv("LEONIDA_LOCAL_DISABLE_OPT");
+    const VkPipelineCreateFlags capture = (stats_path.empty() ? 0 : VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR) |
+                                          (local_fast && local_fast[0] == '1' ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0);
 
     // These capability requirements apply as soon as the module is passed to Vulkan.
     auto check_missing_module_feature = [&](const ShaderMeta& meta) -> std::string {
