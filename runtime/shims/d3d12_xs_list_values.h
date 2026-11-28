@@ -66,6 +66,9 @@
 #include "../src/list_value_wait_budget.h"  // leonida::list_value_wait: work-aware timeout clock & producer graph
 #include "../src/title_page_watch.h"  // leonida::kernel_writes::store
 #include "../src/value_write_sink.h"  // leonida::value_sink: the arena and xmem's PAGE_NOACCESS pages
+#ifdef LEONIDA_VULKAN_DEVICE
+#include "../src/vulkan_device_fault.h"  // LOCAL: leonida::print_thread_stacks on a releaser stall
+#endif
 
 namespace rt::d3d12_xs::list_values {
 
@@ -437,6 +440,9 @@ public:
             if (wake_) {
                 thread_ = CreateThread(nullptr, 0, &Pump::pump_main, this, 0, nullptr);
                 if (thread_) releaser_ = CreateThread(nullptr, 0, &Pump::releaser_main, this, 0, nullptr);
+#ifdef LEONIDA_VULKAN_DEVICE
+                if (thread_ && releaser_) CloseHandle(CreateThread(nullptr, 0, &Pump::watchdog_main, this, 0, nullptr));
+#endif
                 if (thread_ && !releaser_) {  // the pump alone would wait for a releaser forever
                     stop_.store(true, std::memory_order_relaxed);
                     SetEvent(wake_);
@@ -575,6 +581,9 @@ private:
     }
 
     void run() {
+#ifdef LEONIDA_VULKAN_DEVICE
+        pump_tid_.store(GetCurrentThreadId(), std::memory_order_relaxed);
+#endif
         while (!stop_.load(std::memory_order_relaxed)) {
             bool polling = false, writes = false;
             {
@@ -595,9 +604,11 @@ private:
                 WaitForSingleObject(wake_, polling ? kPollMs : writes ? 50 : releasing ? 500 : INFINITE);
             }
             if (stop_.load(std::memory_order_relaxed)) break;
+            pass_since_ms_.store(GetTickCount64() | 1, std::memory_order_relaxed);
             pass(false);
             watch_releaser();
             summarize();
+            pass_since_ms_.store(0, std::memory_order_relaxed);
         }
     }
 
@@ -623,6 +634,50 @@ private:
                          static_cast<unsigned long long>(signal_value_.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(ms));
     }
+
+#ifdef LEONIDA_VULKAN_DEVICE
+    // LOCAL diagnostic: every thread's stack (the pump's and the releaser's too) when the pump has been inside one
+    // step, or the releaser inside one Signal, for 3 s and for 20 s, and at boot times 240 s and 330 s;
+    // twelve dumps at most.
+    static DWORD WINAPI watchdog_main(LPVOID self) {
+        static_cast<Pump*>(self)->watchdog();
+        return 0;
+    }
+    void watchdog() {
+        static constexpr std::uint64_t kAtMs[2] = {3000, 20000};
+        unsigned dumps = 0, pass_taken = 0, signal_taken = 0, fixed_taken = 0;
+        std::uint64_t pass_episode = 0, signal_episode = 0;
+        const auto dump = [&](const char* kind, std::uint64_t ms) {
+            if (dumps >= 12) return;
+            ++dumps;
+            char why[160];
+            std::snprintf(why, sizeof(why), "LOCAL %s ms %llu value %llu releaser %lu", kind,
+                          static_cast<unsigned long long>(ms),
+                          static_cast<unsigned long long>(signal_value_.load(std::memory_order_relaxed)),
+                          releaser_tid_.load(std::memory_order_relaxed));
+            std::fprintf(stderr, "[rt] d3d12_xs: %s (pump thread %lu): all thread stacks follow\n", why,
+                         pump_tid_.load(std::memory_order_relaxed));
+            leonida::print_thread_stacks(0, why);
+        };
+        while (!stop_.load(std::memory_order_relaxed)) {
+            Sleep(250);
+            const std::uint64_t now = GetTickCount64();
+            const std::uint64_t pass_since = pass_since_ms_.load(std::memory_order_relaxed);
+            if (pass_since != pass_episode) pass_episode = pass_since, pass_taken = 0;
+            if (pass_since && pass_taken < 2 && now > pass_since && now - pass_since >= kAtMs[pass_taken])
+                dump("pump-step", now - pass_since), ++pass_taken;
+            const std::uint64_t signal_since = signal_since_ms_.load(std::memory_order_relaxed);
+            if (signal_since != signal_episode) signal_episode = signal_since, signal_taken = 0;
+            if (signal_since && signal_taken < 2 && now > signal_since && now - signal_since >= kAtMs[signal_taken])
+                dump("releaser-signal", now - signal_since), ++signal_taken;
+            static constexpr std::int64_t kFixedMs[2] = {240000, 330000};  // boot time (leonida::diagnostic_ms)
+            const std::int64_t boot_ms = leonida::diagnostic_ms();
+            if (fixed_taken < 2 && boot_ms >= kFixedMs[fixed_taken])
+                dump(fixed_taken ? "fixed-t330" : "fixed-t240", static_cast<std::uint64_t>(boot_ms)), ++fixed_taken;
+        }
+    }
+    std::atomic<DWORD> pump_tid_{0};
+#endif
 
     // Signals the gates the pump opened, in the order it opened them (each queue's gate values rise in that order).
     void release_loop() {
@@ -1146,6 +1201,7 @@ private:
     std::atomic<std::uint64_t> signal_value_{0};
     std::atomic<DWORD> releaser_tid_{0};
     bool stall_logged_ = false;  // the pump thread's only
+    std::atomic<std::uint64_t> pass_since_ms_{0};  // LOCAL: GetTickCount64|1 while the pump is inside one step
     std::mutex settle_mutex_;          // the caller's-thread settling without threads (start_or_settle)
     std::atomic<bool> exiting_{false};  // stop() ran
     std::atomic<bool> stop_{false};    // the threads end
